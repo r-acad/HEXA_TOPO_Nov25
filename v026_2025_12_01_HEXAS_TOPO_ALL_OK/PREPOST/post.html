@@ -1,0 +1,513 @@
+<!DOCTYPE html> 
+<html lang="en"> 
+<head> 
+    <meta charset="UTF-8"> 
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"> 
+    <title>Babylon.js FEM Stress Visualizer (Instanced)</title> 
+    <script src="https://cdn.babylonjs.com/babylon.js"></script> 
+    <script src="https://cdn.tailwindcss.com"></script> 
+    <style> 
+        /* Ensure canvas fills the background */ 
+        html, body { 
+            width: 100%; 
+            height: 100%; 
+            margin: 0; 
+            padding: 0; 
+            overflow: hidden; 
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; 
+        } 
+        #renderCanvas { 
+            width: 100%; 
+            height: 100%; 
+            position: absolute; 
+            top: 0; 
+            left: 0; 
+            z-index: 0; /* Behind the UI */ 
+            touch-action: none; 
+        } 
+        #uiPanel { 
+            position: absolute; 
+            top: 1.5rem; 
+            left: 1.5rem; 
+            z-index: 10; 
+        } 
+    </style> 
+</head> 
+<body class="bg-gray-900"> 
+ 
+    <canvas id="renderCanvas"></canvas> 
+ 
+    <div id="uiPanel" class="bg-white/90 backdrop-blur-sm p-4 rounded-lg shadow-xl w-80 space-y-3"> 
+        <h1 class="text-xl font-bold text-gray-800">Stress Visualizer</h1> 
+         
+        <div> 
+            <label for="fileInput" class="block text-sm font-medium text-gray-700">1. Load Element Data (.json)</label> 
+            <input type="file" id="fileInput" accept=".json" class="mt-1 block w-full text-sm text-gray-500 
+                file:mr-4 file:py-2 file:px-4 
+                file:rounded-md file:border-0 
+                file:text-sm file:font-semibold 
+                file:bg-blue-50 file:text-blue-700 
+                hover:file:bg-blue-100 cursor-pointer"/> 
+        </div> 
+ 
+        <div> 
+            <label for="dataFieldSelect" class="block text-sm font-medium text-gray-700">2. Select Data Field</label> 
+            <select id="dataFieldSelect" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2"> 
+            </select> 
+        </div> 
+ 
+        <div class="space-y-2"> 
+            <h2 class="text-sm font-medium text-gray-700">3. Adjust Color Scale Limits</h2> 
+            <div class="flex gap-2"> 
+                <div> 
+                    <label for="minStress" class="block text-xs font-medium text-gray-600">Min Value</label> 
+                    <input type="text" id="minStress" value="0" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2"> 
+                </div> 
+                <div> 
+                    <label for="maxStress" class="block text-xs font-medium text-gray-600">Max Value</label> 
+                    <input type="text" id="maxStress" value="1" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500 sm:text-sm p-2"> 
+                </div> 
+            </div> 
+            <button id="applyButton" class="w-full bg-blue-600 text-white font-semibold py-2 px-4 rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2 transition duration-150"> 
+                Apply Limits 
+            </button> 
+        </div> 
+ 
+        <div class="border-t pt-3 space-y-2"> 
+            <label for="densitySlider" class="block text-sm font-medium text-gray-700">4. Visibility Threshold (Density)</label> 
+            <div class="flex items-center gap-2"> 
+                <input type="range" id="densitySlider" min="0" max="1" value="0" step="0.01" class="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"> 
+                <span id="densityValue" class="text-sm font-mono w-12 text-right">0.00</span> 
+            </div> 
+        </div> 
+        <div id="status" class="text-sm text-gray-600 border-t pt-2"> 
+            Please load a file. 
+        </div> 
+    </div> 
+ 
+    <script> 
+        // Get the canvas element 
+        const canvas = document.getElementById('renderCanvas'); 
+        // Get UI elements 
+        const fileInput = document.getElementById('fileInput'); 
+        const dataFieldSelect = document.getElementById('dataFieldSelect'); 
+        const minInput = document.getElementById('minStress'); 
+        const maxInput = document.getElementById('maxStress'); 
+        const applyButton = document.getElementById('applyButton'); 
+        const statusEl = document.getElementById('status'); 
+        // --- NEW SLIDER ELEMENTS --- 
+        const densitySlider = document.getElementById('densitySlider'); 
+        const densityValue = document.getElementById('densityValue'); 
+ 
+        // --- Global Variables --- 
+        let engine; 
+        let scene; 
+        let allElementData = []; 
+        let availableFields = []; 
+        let currentDataField = 'von_mises_stress'; // Default 
+        let dataMinStress = 0; 
+        let dataMaxStress = 1; 
+        let currentMin = 0; 
+        let currentMax = 1; 
+        let rootNode = null; // A parent for all cubes 
+        let templateBox = null; // The master template mesh 
+        let ground = null; 
+        let groundMat = null; 
+        let elementSize = { dx: 0.1, dy: 0.1, dz: 0.1 }; 
+        let currentDensityThreshold = 0.0; // --- NEW GLOBAL FOR SLIDER --- 
+ 
+        /** 
+         * Initializes the Babylon.js engine and scene. 
+         */ 
+        function initBabylon() { 
+            engine = new BABYLON.Engine(canvas, true); 
+            scene = new BABYLON.Scene(engine); 
+            scene.clearColor = new BABYLON.Color4(0.1, 0.1, 0.15, 1); 
+ 
+            const camera = new BABYLON.ArcRotateCamera("camera", -Math.PI / 2, Math.PI / 2.5, 50, new BABYLON.Vector3(0, 5, 0), scene); 
+            camera.attachControl(canvas, true); 
+            camera.wheelPrecision = 50; 
+ 
+            const light = new BABYLON.HemisphericLight("light", new BABYLON.Vector3(1, 1, 0), scene); 
+            light.intensity = 0.8; 
+ 
+            ground = BABYLON.MeshBuilder.CreateGround("ground", {width: 100, height: 100}, scene); 
+            groundMat = new BABYLON.StandardMaterial("groundMat", scene); 
+            groundMat.diffuseColor = new BABYLON.Color3(0.3, 0.3, 0.3); 
+            groundMat.specularColor = new BABYLON.Color3(0.1, 0.1, 0.1); 
+            ground.material = groundMat; 
+ 
+            engine.runRenderLoop(() => { 
+                scene.render(); 
+            }); 
+ 
+            window.addEventListener('resize', () => { 
+                engine.resize(); 
+            }); 
+        } 
+ 
+        /** 
+         * Handles the file input event. 
+         */ 
+        function handleFileLoad(event) { 
+            const file = event.target.files[0]; 
+            if (!file) return; 
+ 
+            statusEl.textContent = 'Loading file...'; 
+            const reader = new FileReader(); 
+ 
+            reader.onload = (e) => { 
+                try { 
+                    allElementData = JSON.parse(e.target.result); 
+                    if (!Array.isArray(allElementData) || allElementData.length === 0) { 
+                        throw new Error("Invalid or empty data array."); 
+                    } 
+                    if (!allElementData[0].hasOwnProperty('centroid') || !allElementData[0].hasOwnProperty('young_modulus')) { 
+                        throw new Error("JSON items are missing 'centroid' or 'young_modulus' key."); 
+                    } 
+                     
+                    discoverAvailableFields(); 
+                    populateDropdown(); 
+ 
+                    statusEl.textContent = `Loaded ${allElementData.length} elements.`; 
+                     
+                    // Reset slider 
+                    densitySlider.value = 0; 
+                    densityValue.textContent = "0.00"; 
+                    currentDensityThreshold = 0.0; 
+ 
+                    processData(); 
+                } catch (err) { 
+                    statusEl.textContent = `Error: ${err.message}`; 
+                    allElementData = []; 
+                } 
+            }; 
+ 
+            reader.readAsText(file); 
+        } 
+ 
+        /** 
+         * Inspects the first data element to find renderable fields. 
+         */ 
+        function discoverAvailableFields() { 
+            availableFields = []; 
+            if (allElementData.length === 0) return; 
+ 
+            const firstEl = allElementData[0]; 
+            for (const key in firstEl) { 
+                const value = firstEl[key]; 
+                if (typeof value === 'number' && key !== 'element_id') { 
+                    availableFields.push(key); 
+                } 
+                if (key === 'principal_stresses' && Array.isArray(value) && value.length >= 3) { 
+                    availableFields.push('principal_stresses_P1'); 
+                    availableFields.push('principal_stresses_P2'); 
+                    availableFields.push('principal_stresses_P3'); 
+                } 
+            } 
+ 
+            if (availableFields.includes('von_mises_stress')) { 
+                currentDataField = 'von_mises_stress'; 
+            } else if (availableFields.length > 0) { 
+                currentDataField = availableFields[0]; 
+            } 
+        } 
+ 
+        /** 
+         * Populates the dropdown <select> element. 
+         */ 
+        function populateDropdown() { 
+            dataFieldSelect.innerHTML = ""; 
+            availableFields.forEach(field => { 
+                const option = document.createElement('option'); 
+                option.value = field; 
+                option.text = field; 
+                dataFieldSelect.appendChild(option); 
+            }); 
+            dataFieldSelect.value = currentDataField; 
+        } 
+ 
+        /** 
+         * Gets the value for a specific field from an element. 
+         */ 
+        function getElementValue(element, field) { 
+            if (field === 'principal_stresses_P1') { 
+                return element.principal_stresses ? element.principal_stresses[0] : 0; 
+            } 
+            if (field === 'principal_stresses_P2') { 
+                return element.principal_stresses ? element.principal_stresses[1] : 0; 
+            } 
+            if (field === 'principal_stresses_P3') { 
+                return element.principal_stresses ? element.principal_stresses[2] : 0; 
+            } 
+            return element[field] || 0; 
+        } 
+ 
+        /** 
+         * Calculates min/max for the given field and updates the UI. 
+         */ 
+        function updateDataStats(field) { 
+            if (allElementData.length === 0) return; 
+ 
+            let min = Infinity; 
+            let max = -Infinity; 
+            allElementData.forEach(el => { 
+                // --- MODIFIED: Only use visible elements for stats --- 
+                const youngModulus = el.young_modulus || 0; 
+                if (youngModulus >= currentDensityThreshold) { 
+                    const value = getElementValue(el, field); 
+                    if (value < min) min = value; 
+                    if (value > max) max = value; 
+                } 
+            }); 
+ 
+            // Handle case where no elements are visible 
+            if (min === Infinity) { 
+                min = 0; 
+                max = 1; 
+            } 
+ 
+            dataMinStress = min; 
+            dataMaxStress = max; 
+            currentMin = dataMinStress; 
+            currentMax = dataMaxStress; 
+ 
+            if (currentMin === currentMax) { 
+                currentMin -= 0.1 * Math.abs(currentMin) + 0.1; 
+                currentMax += 0.1 * Math.abs(currentMax) + 0.1; 
+            } 
+ 
+            minInput.value = currentMin.toExponential(4); 
+            maxInput.value = currentMax.toExponential(4); 
+        } 
+         
+        /** 
+         * Infers element size from centroid data. 
+         */ 
+        function calculateElementSize(elements) { 
+            if (elements.length < 2) { 
+                return { dx: 0.1, dy: 0.1, dz: 0.1 }; 
+            } 
+ 
+            const xCoords = [...new Set(elements.map(el => el.centroid[0]))].sort((a, b) => a - b); 
+            const yCoords = [...new Set(elements.map(el => el.centroid[1]))].sort((a, b) => a - b); 
+            const zCoords = [...new Set(elements.map(el => el.centroid[2]))].sort((a, b) => a - b); 
+ 
+            const findMinGap = (coords) => { 
+                if (coords.length < 2) return Infinity; 
+                let minGap = Infinity; 
+                for (let i = 1; i < coords.length; i++) { 
+                    const gap = coords[i] - coords[i-1]; 
+                    if (gap > 1e-6) { 
+                        minGap = Math.min(minGap, gap); 
+                    } 
+                } 
+                return minGap; 
+            }; 
+ 
+            let dx = findMinGap(xCoords); 
+            let dy = findMinGap(yCoords); 
+            let dz = findMinGap(zCoords); 
+ 
+            const validSizes = [dx, dy, dz].filter(s => s !== Infinity && s > 1e-6); 
+            const defaultSize = (validSizes.length > 0) ? validSizes[0] : 0.1; 
+ 
+            if (dx === Infinity || dx <= 1e-6) dx = defaultSize; 
+            if (dy === Infinity || dy <= 1e-6) dy = defaultSize; 
+            if (dz === Infinity || dz <= 1e-6) dz = defaultSize; 
+             
+            console.log(`Inferred element size (dx, dy, dz): ${dx.toFixed(3)}, ${dy.toFixed(3)}, ${dz.toFixed(3)}`); 
+            return { dx, dy, dz }; 
+        } 
+ 
+        /** 
+         * Finds min/max stress and updates UI and scene. 
+         */ 
+        function processData() { 
+            if (allElementData.length === 0) return; 
+ 
+            elementSize = calculateElementSize(allElementData); 
+            updateDataStats(currentDataField); 
+            drawElements(); 
+             
+            if (rootNode && rootNode.getChildMeshes().length > 0) { 
+                let minVec = new BABYLON.Vector3(Infinity, Infinity, Infinity); 
+                let maxVec = new BABYLON.Vector3(-Infinity, -Infinity, -Infinity); 
+ 
+                allElementData.forEach(el => { 
+                    const pos = new BABYLON.Vector3(el.centroid[0], el.centroid[1], el.centroid[2]); 
+                    minVec.MinimizeInPlace(pos); 
+                    maxVec.MaximizeInPlace(pos); 
+                }); 
+                 
+                const halfSize = new BABYLON.Vector3(elementSize.dx / 2, elementSize.dy / 2, elementSize.dz / 2); 
+                minVec.subtractInPlace(halfSize); 
+                maxVec.addInPlace(halfSize); 
+ 
+                const boundingInfo = new BABYLON.BoundingInfo(minVec, maxVec); 
+                scene.activeCamera.target = boundingInfo.center; 
+                const maxDim = Math.max(boundingInfo.extent.x, boundingInfo.extent.y, boundingInfo.extent.z); 
+                scene.activeCamera.radius = maxDim * 3;  
+ 
+                if (ground) { 
+                    const groundWidth = boundingInfo.extent.x * 2.5 + elementSize.dx * 4; 
+                    const groundDepth = boundingInfo.extent.z * 2.5 + elementSize.dz * 4; 
+                    const groundSize = Math.max(groundWidth, groundDepth, 10); 
+                     
+                    ground.scaling.x = groundSize / 100; 
+                    ground.scaling.z = groundSize / 100; 
+                    ground.position.y = boundingInfo.minimum.y - 0.01; 
+                } 
+            } 
+        } 
+ 
+        /** 
+         * Creates all element instances. 
+         */ 
+        function drawElements() { 
+            if (!scene) return; 
+ 
+            if (rootNode) rootNode.dispose(); 
+            if (templateBox) templateBox.dispose(); 
+ 
+            rootNode = new BABYLON.TransformNode("elementRoot", scene); 
+             
+            templateBox = BABYLON.MeshBuilder.CreateBox("template", {  
+                width: elementSize.dx,  
+                height: elementSize.dy,  
+                depth: elementSize.dz  
+            }, scene); 
+             
+            templateBox.isVisible = false;  
+            templateBox.registerInstancedBuffer("color", 3); 
+             
+            const templateMat = new BABYLON.StandardMaterial("templateMat", scene); 
+            templateMat.diffuseColor = new BABYLON.Color3(1, 1, 1);  
+            templateMat.specularColor = new BABYLON.Color3(0.2, 0.2, 0.2); 
+            templateBox.material = templateMat; 
+ 
+            allElementData.forEach((el, index) => { 
+                const centroid = el.centroid; 
+                const boxInstance = templateBox.createInstance(`element_${index}`); 
+                 
+                boxInstance.position = new BABYLON.Vector3(centroid[0], centroid[1], centroid[2]); 
+                boxInstance.parent = rootNode; 
+                boxInstance.metadata = el; 
+            }); 
+             
+            const count = updateElementVisuals(); // Apply initial visuals 
+            statusEl.textContent = `Rendered ${allElementData.length} elements. Showing ${count}.`; 
+        } 
+ 
+        /** 
+         * Updates visibility AND colors of all existing instances. 
+         * Returns the count of visible elements. 
+         */ 
+        function updateElementVisuals() { 
+            if (!rootNode) return 0; 
+ 
+            const instances = rootNode.getChildMeshes(); 
+            if (instances.length === 0) return 0; 
+ 
+            let visibleCount = 0; 
+            instances.forEach(instance => { 
+                if (instance.metadata && instance.instancedBuffers) { 
+                     
+                    // --- 1. VISIBILITY CHECK --- 
+                    // We assume young_modulus is the 0-1 density field 
+                    const youngModulus = instance.metadata.young_modulus || 0;  
+                    const isVisible = (youngModulus >= currentDensityThreshold); 
+                    instance.isVisible = isVisible; 
+ 
+                    if (isVisible) { 
+                        // --- 2. COLOR LOGIC --- 
+                        const value = getElementValue(instance.metadata, currentDataField); 
+                        instance.instancedBuffers.color = getColorForValue(value); 
+                        visibleCount++; 
+                    } 
+                } else { 
+                    instance.isVisible = false; 
+                } 
+            }); 
+             
+            return visibleCount; // Return the count 
+        } 
+ 
+        /** 
+         * Converts a value to a rainbow color. 
+         */ 
+        function getColorForValue(value) { 
+            let range = currentMax - currentMin; 
+            if (range <= 0) range = 1; 
+ 
+            let normalized = (value - currentMin) / range; 
+            normalized = Math.max(0, Math.min(1, normalized)); // Clamp 0-1 
+ 
+            const hue = (1.0 - normalized) * 240; // 240=Blue, 0=Red 
+            return BABYLON.Color3.FromHSV(hue, 1, 1); 
+        } 
+ 
+        /** 
+         * Applies the user-defined min/max limits for COLOR. 
+         */ 
+        function handleApplyLimits() { 
+            const minVal = parseFloat(minInput.value); 
+            const maxVal = parseFloat(maxInput.value); 
+ 
+            if (isNaN(minVal) || isNaN(maxVal)) { 
+                statusEl.textContent = "Error: Invalid min/max values."; 
+                return; 
+            } 
+            if (minVal >= maxVal) { 
+                statusEl.textContent = "Error: Min must be less than max."; 
+                return; 
+            } 
+ 
+            currentMin = minVal; 
+            currentMax = maxVal; 
+             
+            // Re-apply visuals (colors will change) 
+            const count = updateElementVisuals(); 
+            statusEl.textContent = `Color limits applied. Showing ${count} elements.`; 
+        } 
+ 
+        /** 
+         * Handles the user changing the data field dropdown for COLOR. 
+         */ 
+        function handleFieldChange(event) { 
+            currentDataField = event.target.value; 
+             
+            // Recalculate stats for the new field (based on visible elements) 
+            updateDataStats(currentDataField); 
+ 
+            // Update all instance visuals (colors will change) 
+            const count = updateElementVisuals(); 
+            statusEl.textContent = `Switched to ${currentDataField}. Showing ${count} elements.`; 
+        } 
+ 
+        /** 
+         * (NEW) Handles the user sliding the density/visibility bar. 
+         */ 
+        function handleDensityChange(event) { 
+            currentDensityThreshold = parseFloat(event.target.value); 
+            densityValue.textContent = currentDensityThreshold.toFixed(2); 
+             
+            // Re-calculate color stats based on new set of visible elements 
+            updateDataStats(currentDataField);  
+ 
+            // Update all instance visuals (visibility and colors will change) 
+            const visibleCount = updateElementVisuals(); 
+ 
+            statusEl.textContent = `Threshold: ${currentDensityThreshold.toFixed(2)}. Showing ${visibleCount} elements.`; 
+        } 
+ 
+        // --- Event Listeners --- 
+        window.addEventListener('DOMContentLoaded', initBabylon); 
+        fileInput.addEventListener('change', handleFileLoad); 
+        applyButton.addEventListener('click', handleApplyLimits); 
+        dataFieldSelect.addEventListener('change', handleFieldChange); 
+        densitySlider.addEventListener('input', handleDensityChange); // --- NEW LISTENER --- 
+ 
+    </script> 
+</body> 
+</html> 
